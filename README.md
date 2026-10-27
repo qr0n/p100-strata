@@ -28,6 +28,25 @@ the extra experts in VRAM (below) account for most of the KL difference. The eng
 is not bit-for-bit deterministic between runs (two runs of one config differ by
 about 0.0002 KL), so changes of that size are noise.
 
+## Quick start
+
+This repo ships the patched source, ready to build. No `git am`, no upstream checkout:
+
+    git clone https://github.com/qr0n/p100-strata && cd p100-strata
+    ./build.sh                    # needs CUDA 12.x + cmake; the engine lands in strata/build-p100/strata
+
+`strata/` is upstream **`v0.2.2` (`011c9e60`)** plus `patches/0001`-`0006`, nothing else.
+`tools/verify-source.sh` re-derives it from upstream and diffs it, to prove that.
+
+CUDA 12.x only (`nvidia-cuda-toolkit` 12.4 here). **CUDA 13 dropped Pascal.** 12.4's nvcc needs gcc 13 or older;
+`build.sh` uses `gcc-13` when it is installed. Build the weight pack and MTP draft head with Strata's own tools
+(see `strata/docs`).
+
+Prefer patches? They are in `patches/`, against upstream `v0.2.2`:
+
+    git clone https://github.com/Niko1221/Strata && cd Strata && git checkout v0.2.2
+    git am /path/to/p100-strata/patches/0*.patch
+
 ## The patches
 
 Against upstream **`v0.2.2` (`011c9e60`)**, in order:
@@ -43,28 +62,12 @@ Against upstream **`v0.2.2` (`011c9e60`)**, in order:
 `patches/v1-99f3dbd/` and `configs/v1-99f3dbd/` are the earlier patch for
 upstream `99f3dbd`, kept for history.
 
-## Build
-
-CUDA 12.x (`nvidia-cuda-toolkit` 12.4 here). **CUDA 13 dropped Pascal.**
-12.4's nvcc needs gcc 13 or older.
-
-    git clone https://github.com/Niko1221/Strata && cd Strata
-    git checkout v0.2.2
-    git am /path/to/p100-strata/patches/0*.patch
-    cmake -B build-p100 -DCMAKE_BUILD_TYPE=Release \
-        -DSTRATA_ENABLE_CUDA=ON -DSTRATA_EXPERIMENTAL_SM60=ON \
-        -DCMAKE_CUDA_ARCHITECTURES=60-real \
-        -DCMAKE_C_COMPILER=gcc-13 -DCMAKE_CXX_COMPILER=g++-13 \
-        -DCMAKE_CUDA_HOST_COMPILER=g++-13
-    cmake --build build-p100 -j --target strata
-
-Build the weight pack and MTP draft head with Strata's own tools (see its docs).
-
 ## Serve
 
-`configs/strata-atomic.json` is the config in use; edit the paths.
+`configs/strata-atomic.json` is the config in use; edit the paths. The server needs Strata's Python packages
+(`python -m venv .venv && .venv/bin/pip install -r strata/requirements.txt`).
 
-    python -m serve.server --engine strata --config configs/strata-atomic.json \
+    cd strata && python -m serve.server --engine strata --config ../configs/strata-atomic.json \
         --host 127.0.0.1 --port 8090
 
 Settings that matter (the last row of the table needs the first three):
