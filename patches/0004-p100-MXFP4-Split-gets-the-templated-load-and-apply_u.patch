@@ -1,0 +1,45 @@
+From b6a9f82d8f36856fff760f0c2445dbb2aacbc028 Mon Sep 17 00:00:00 2001
+From: qr0n <77075118+qr0n@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 17:45:14 +0000
+Subject: [PATCH 4/6] p100: MXFP4 Split gets the templated load and apply_u of
+ upstream's split kernels
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/kernels/cuda/iq_kernels.cu | 13 ++++++++++++-
+ 1 file changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/src/kernels/cuda/iq_kernels.cu b/src/kernels/cuda/iq_kernels.cu
+index 68452225..c77d6061 100644
+--- a/src/kernels/cuda/iq_kernels.cu
++++ b/src/kernels/cuda/iq_kernels.cu
+@@ -1170,7 +1170,8 @@ template<> struct Split<20> {   // IQ4_NL
+ template<> inline constexpr bool kSplit<39> = true;
+ template<> struct Split<39> {   // MXFP4: Split<20> with byte-aligned nibbles, the e2m1 table and the E8M0 scale
+     struct W { int2 v[2]; float dw; };
+-    __device__ static W load(const void* __restrict__ vbq, int kbx, int iqs) {
++    template<bool STAGE_GRID = false>
++    __device__ static W load(const void* __restrict__ vbq, int kbx, int iqs, const uint32_t* __restrict__ = nullptr) {
+         const block_mxfp4* bq4 = (const block_mxfp4*) vbq + kbx;
+         W r;
+ #pragma unroll
+@@ -1189,6 +1190,16 @@ template<> struct Split<39> {   // MXFP4: Split<20> with byte-aligned nibbles, t
+         const float d = r.dw * __low2float(bq8_1->ds);
+         return d * sumi;
+     }
++    // `apply` with the block's words in registers, as Split<20>::apply_u
++    __device__ static float apply_u(const W& r, int2 p0, int2 p1, float d8) {
++        int sumi = 0;
++        sumi = ggml_cuda_dp4a(r.v[0].x, p0.x, sumi);
++        sumi = ggml_cuda_dp4a(r.v[0].y, p1.x, sumi);
++        sumi = ggml_cuda_dp4a(r.v[1].x, p0.y, sumi);
++        sumi = ggml_cuda_dp4a(r.v[1].y, p1.y, sumi);
++        const float d = r.dw * d8;
++        return d * sumi;
++    }
+ };
+ template<> inline constexpr bool kSplit<23> = true;
+ template<> struct Split<23> {   // IQ4_XS
+-- 
+2.53.0
+

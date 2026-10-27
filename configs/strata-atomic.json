@@ -1,19 +1,53 @@
 {
-  "exe": "/mnt/llm-cache/tools/src/strata/build-p100/strata",
-  "args": [
-    "--pack", "/mnt/llm-cache/strata/packs/atomic-iq4xs",
-    "--native", "/mnt/llm-cache/gguf/AtomicChat/Qwen3.8-Flash-Next-GGUF/Qwen3.8-Flash-Next-AD-3.84bpw-IQ4_XS-M64/Qwen3.8-Flash-Next-AD-3.84bpw-IQ4_XS-M64-00001-of-00028.gguf",
-    "--ple-io", "ram",
-    "--expert-profile", "/mnt/llm-cache/tools/src/strata/data/expert-profile.bin", "--expert-cache", "auto",
-    "--prefill", "auto", "--spec", "4", "--spec-min-p", "0.5",
-    "--mtp", "/mnt/llm-cache/strata/mtp/rt", "--max-context", "131072", "--kv", "int8"
-  ],
-  "gpu": [0, 1],
-  "layer_split": "auto",
-  "cwd": "/mnt/llm-cache/tools/src/strata",
-  "tokenizer": "/mnt/llm-cache/strata/packs/atomic-iq4xs/tokenizer",
-  "model_name": "qwen3.8-flash-next-strata",
-  "log": "/mnt/llm-cache/strata/strata-atomic.log",
-  "host": "127.0.0.1",
-  "port": 8090
+    "exe": "/mnt/llm-cache/strata/bin/p100-v2-h2-88d1a002/strata",
+    "args": [
+        "--pack",
+        "/mnt/llm-cache/strata/packs/atomic-iq4xs",
+        "--native",
+        "/mnt/llm-cache/gguf/AtomicChat/Qwen3.8-Flash-Next-GGUF/Qwen3.8-Flash-Next-AD-3.84bpw-IQ4_XS-M64/Qwen3.8-Flash-Next-AD-3.84bpw-IQ4_XS-M64-00001-of-00028.gguf",
+        "--ple-io",
+        "ram",
+        "--expert-profile",
+        "/mnt/llm-cache/tools/src/strata-v2/data/expert-profile.bin",
+        "--expert-cache",
+        "auto",
+        "--prefill",
+        "auto",
+        "--spec",
+        "4",
+        "--spec-min-p",
+        "0.5",
+        "--mtp",
+        "/mnt/llm-cache/strata/mtp/rt",
+        "--max-context",
+        "262144",
+        "--kv",
+        "int8",
+        "--kv-resident",
+        "32768",
+        "--vram-reserve-later-mib",
+        "1103",
+        "--trim-stage-weights"
+    ],
+    "gpu": [
+        0,
+        1
+    ],
+    "layer_split": "25",
+    "cwd": "/mnt/llm-cache/tools/src/strata-v2",
+    "tokenizer": "/mnt/llm-cache/strata/packs/atomic-iq4xs/tokenizer",
+    "model_name": "qwen3.8-flash-next-strata",
+    "log": "/mnt/llm-cache/strata/strata-atomic-v2.log",
+    "host": "127.0.0.1",
+    "port": 8192,
+    "env": {
+        "STRATA_ROUTE_TAIL_SKIP": "0",
+        "STRATA_Q8_SM60": "1"
+    },
+    "vision": {
+        "exe": "/mnt/llm-cache/tools/src/strata-v2/build-vision/bin/strata-vision",
+        "mmproj": "/mnt/llm-cache/gguf/AtomicChat/Qwen3.8-Flash-Next-GGUF/mmproj-Qwen3.8-Flash-Next-F16.gguf",
+        "model": "/mnt/llm-cache/gguf/AtomicChat/Qwen3.8-Flash-Next-GGUF/Qwen3.8-Flash-Next-AD-3.84bpw-IQ4_XS-M64/Qwen3.8-Flash-Next-AD-3.84bpw-IQ4_XS-M64-00001-of-00028.gguf",
+        "threads": 16
+    }
 }

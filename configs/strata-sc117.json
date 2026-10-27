@@ -1,20 +1,58 @@
 {
-  "exe": "/mnt/llm-cache/tools/src/strata/build-p100/strata",
+  "exe": "/mnt/llm-cache/tools/src/strata-v2/build-p100/strata",
   "args": [
-    "--pack", "/mnt/llm-cache/strata/packs/sc117-iq3xxs",
-    "--native", "/mnt/llm-cache/gguf/SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF/IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_XXS-00001-of-00002.gguf",
-    "--ple-gguf", "/mnt/llm-cache/gguf/SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF/IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_XXS-00002-of-00002.gguf",
-    "--ple-io", "ram",
-    "--expert-profile", "/mnt/llm-cache/tools/src/strata/data/expert-profile.bin", "--expert-cache", "auto",
-    "--prefill", "auto", "--spec", "4", "--spec-min-p", "0.5",
-    "--mtp", "/mnt/llm-cache/strata/mtp/rt", "--max-context", "131072", "--kv", "int8"
+    "--pack",
+    "/mnt/llm-cache/strata/packs/sc117-iq3xxs",
+    "--native",
+    "/mnt/llm-cache/gguf/SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF/IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_XXS-00001-of-00002.gguf",
+    "--ple-gguf",
+    "/mnt/llm-cache/gguf/SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF/IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_XXS-00002-of-00002.gguf",
+    "--ple-io",
+    "ram",
+    "--expert-profile",
+    "/mnt/llm-cache/tools/src/strata-v2/data/expert-profile.bin",
+    "--expert-cache",
+    "auto",
+    "--prefill",
+    "auto",
+    "--spec",
+    "4",
+    "--spec-min-p",
+    "0.5",
+    "--mtp",
+    "/mnt/llm-cache/strata/mtp/rt",
+    "--max-context",
+    "262144",
+    "--kv",
+    "int8",
+    "--kv-resident",
+    "32768",
+    "--vram-reserve-later-mib",
+    "1103"
   ],
-  "gpu": [0, 1],
+  "gpu": [
+    0,
+    1
+  ],
   "layer_split": "auto",
-  "cwd": "/mnt/llm-cache/tools/src/strata",
+  "cwd": "/mnt/llm-cache/tools/src/strata-v2",
   "tokenizer": "/mnt/llm-cache/strata/packs/sc117-iq3xxs/tokenizer",
   "model_name": "qwen3.8-flash-next-uncensored-strata",
-  "log": "/mnt/llm-cache/strata/strata-sc117.log",
+  "log": "/mnt/llm-cache/strata/strata-sc117-v2.log",
   "host": "127.0.0.1",
-  "port": 8091
+  "port": 8193,
+  "summary_reasoning_budget_tokens": 1024,
+  "summary_prompt_prefixes": [
+    "You are a context summarization assistant."
+  ],
+  "summary_min_tokens": 40960,
+  "env": {
+    "STRATA_ROUTE_TAIL_SKIP": "0"
+  },
+  "vision": {
+    "exe": "/mnt/llm-cache/tools/src/strata-v2/build-vision/bin/strata-vision",
+    "mmproj": "/mnt/llm-cache/gguf/SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF/mmproj-Qwen3.8-Flash-Next-BF16.gguf",
+    "model": "/mnt/llm-cache/gguf/SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF/IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_XXS-00001-of-00002.gguf",
+    "threads": 16
+  }
 }

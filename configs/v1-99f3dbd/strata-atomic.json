@@ -1,0 +1,19 @@
+{
+  "exe": "/mnt/llm-cache/tools/src/strata/build-p100/strata",
+  "args": [
+    "--pack", "/mnt/llm-cache/strata/packs/atomic-iq4xs",
+    "--native", "/mnt/llm-cache/gguf/AtomicChat/Qwen3.8-Flash-Next-GGUF/Qwen3.8-Flash-Next-AD-3.84bpw-IQ4_XS-M64/Qwen3.8-Flash-Next-AD-3.84bpw-IQ4_XS-M64-00001-of-00028.gguf",
+    "--ple-io", "ram",
+    "--expert-profile", "/mnt/llm-cache/tools/src/strata/data/expert-profile.bin", "--expert-cache", "auto",
+    "--prefill", "auto", "--spec", "4", "--spec-min-p", "0.5",
+    "--mtp", "/mnt/llm-cache/strata/mtp/rt", "--max-context", "131072", "--kv", "int8"
+  ],
+  "gpu": [0, 1],
+  "layer_split": "auto",
+  "cwd": "/mnt/llm-cache/tools/src/strata",
+  "tokenizer": "/mnt/llm-cache/strata/packs/atomic-iq4xs/tokenizer",
+  "model_name": "qwen3.8-flash-next-strata",
+  "log": "/mnt/llm-cache/strata/strata-atomic.log",
+  "host": "127.0.0.1",
+  "port": 8090
+}
