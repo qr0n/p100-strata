@@ -1,0 +1,67 @@
+{
+  "exe": "/mnt/llm-cache/strata/bin/p100-v2-h2-f16d-05ac61ba/strata",
+  "args": [
+    "--pack",
+    "/mnt/llm-cache/strata/packs/sc117-iq3xxs",
+    "--native",
+    "/mnt/llm-cache/gguf/SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF/IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_XXS-00001-of-00002.gguf",
+    "--ple-gguf",
+    "/mnt/llm-cache/gguf/SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF/IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_XXS-00002-of-00002.gguf",
+    "--ple-io",
+    "ram",
+    "--expert-profile",
+    "/mnt/llm-cache/tools/src/strata-v2/data/expert-profile.bin",
+    "--expert-cache",
+    "auto",
+    "--prefill",
+    "auto",
+    "--spec",
+    "4",
+    "--spec-min-p",
+    "0.5",
+    "--mtp",
+    "/mnt/llm-cache/strata/mtp/rt",
+    "--max-context",
+    "262144",
+    "--kv",
+    "int8",
+    "--kv-resident",
+    "32768",
+    "--vram-reserve-later-mib",
+    "1103",
+    "--peer-device",
+    "1",
+    "--peer-reserve-mib",
+    "2000"
+  ],
+  "gpu": [
+    0,
+    1
+  ],
+  "layer_split": "auto",
+  "cwd": "/mnt/llm-cache/tools/src/strata-v2",
+  "tokenizer": "/mnt/llm-cache/strata/packs/sc117-iq3xxs/tokenizer",
+  "model_name": "qwen3.8-flash-next-uncensored-strata",
+  "log": "/mnt/llm-cache/strata/strata-sc117-v2.log",
+  "host": "127.0.0.1",
+  "port": 8193,
+  "summary_reasoning_budget_tokens": 1024,
+  "summary_prompt_prefixes": [
+    "You are a context summarization assistant."
+  ],
+  "summary_min_tokens": 40960,
+  "env": {
+    "STRATA_ROUTE_TAIL_SKIP": "0",
+    "STRATA_Q8_SM60": "1",
+    "STRATA_GU_F16": "2",
+    "STRATA_SM60_D20_SUB": "1",
+    "STRATA_DOWN_F16": "1",
+    "STRATA_B6_F16": "1"
+  },
+  "vision": {
+    "exe": "/mnt/llm-cache/tools/src/strata-v2/build-vision/bin/strata-vision",
+    "mmproj": "/mnt/llm-cache/gguf/SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF/mmproj-Qwen3.8-Flash-Next-BF16.gguf",
+    "model": "/mnt/llm-cache/gguf/SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF/IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_XXS-00001-of-00002.gguf",
+    "threads": 16
+  }
+}

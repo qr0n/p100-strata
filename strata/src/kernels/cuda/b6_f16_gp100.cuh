@@ -1,0 +1,415 @@
+// GP100 (sm_60) fp16 multi-column dense GEMVs for Q4_K, Q5_K, Q6_K and IQ4_XS (STRATA_B6_F16=1, opt-in).
+//
+// Included by native_mmvq.cu (CUDA only). sm_60 has no __dp4a, so the exact b6/multi kernels emulate every int8 dot with
+// four scalar multiply-adds and are instruction-issue bound. GP100 has full-rate half2 FMA, so here (ported from the
+// llama.cpp GP100 path, qr0n/p100-llama-cpp mmvq-gp100.cu, which takes f32 activations):
+//   - the q8_1 activations are converted once per call to fp16 (int8 values are exact in fp16), with
+//     ys[b] = {d8 * 2^24, d8 * sum32(q)} and s16[2b + h] = d8 * sum16(q), all exact from the integers;
+//   - weights are unpacked by byte permutes straight into SUBNORMAL half bit patterns (code * 2^-24, exact);
+//   - products accumulate in fp16 over one sub-block, then are flushed to fp32 with the sub-block scale.
+// NOT bitwise the exact kernels (fp16 accumulation rounds once the partial sum passes 2048 units).
+// STRATA_B6_F16_CHECK=1 runs the exact kernel too on each new (type, n_in, n_out, ncols) and prints the relative RMS.
+#pragma once
+
+namespace gp100b6 {
+
+__device__ __forceinline__ uint32_t prmt(uint32_t a, uint32_t b, uint32_t c) {
+    uint32_t r;
+    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(r) : "r"(a), "r"(b), "r"(c));
+    return r;
+}
+// byte `sel` of w -> float, exact: place it in the mantissa of 2^23 and subtract 2^23
+__device__ __forceinline__ float byte_f(uint32_t w, int sel) {
+    return __int_as_float(__byte_perm(w, 0x4B000000u, 0x7650 | sel)) - 8388608.f;
+}
+// int8 byte `sel` of w -> float, exact: 2^23 + (b ^ 0x80) - (2^23 + 128)
+__device__ __forceinline__ float s8_f(uint32_t w, int sel) {
+    return __int_as_float(__byte_perm(w ^ 0x80808080u, 0x4B000000u, 0x7650 | sel)) - 8388736.f;
+}
+
+// one warp per q8_1 block: y[b * 32 + l] = q, ys[b] = {d8 * 2^24, d8 * sum q}, s16[2b + h] = d8 * sum of half h
+__global__ void prep_q81(const Q81Block* __restrict__ x, half* __restrict__ y, float2* __restrict__ ys,
+                         float* __restrict__ s16, int nblocks) {
+    const int b = int(blockIdx.x) * (int(blockDim.x) / 32) + int(threadIdx.x) / 32;
+    const int l = int(threadIdx.x) % 32;
+    if (b >= nblocks) return;
+    const int q = x[b].qs[l];
+    int s = q;
+#pragma unroll
+    for (int o = 1; o < 16; o <<= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
+    const float d8 = __low2float(x[b].ds);
+    if (l % 16 == 0) s16[2 * b + l / 16] = d8 * float(s);
+    s += __shfl_xor_sync(0xffffffffu, s, 16);
+    y[b * 32 + l] = __int2half_rn(q);
+    if (l == 0) ys[b] = make_float2(d8 * 16777216.0f, d8 * float(s));
+}
+
+template<typename B> struct KQ;
+template<> struct KQ<Q4KBlock> { static constexpr int qs_u4 = 1; static constexpr bool has_qh = false; };
+template<> struct KQ<Q5KBlock> { static constexpr int qs_u4 = 3; static constexpr bool has_qh = true; };
+
+// Q4_K/Q5_K: one warp computes R rows; 4 groups of 8 threads each take one super-block per iteration, thread t of a group
+// owns sub-blocks 2(t/2) and 2(t/2)+1, positions 16(t%2)..+15. Each row's 32 weights per thread are unpacked once into 16
+// half2 and FMA'd against every column.
+template<typename BLK, int R, int NC>
+__global__ void __launch_bounds__(128) kq_nc(const BLK* __restrict__ W, const half* __restrict__ y,
+                                             const float2* __restrict__ ys, float* __restrict__ dst, int nrows, int nsb) {
+    constexpr int U4 = sizeof(BLK) / sizeof(uint4);
+    const int K = nsb * 256;
+    const int lane = int(threadIdx.x) % 32;
+    const int row0 = (int(blockIdx.x) * 4 + int(threadIdx.x) / 32) * R;
+    const int g = lane / 8, t = lane % 8, jj = t / 2, hf = t % 2;
+    const uint4* base[R];
+#pragma unroll
+    for (int r = 0; r < R; r++) base[r] = (const uint4*) (W + (int64_t) min(row0 + r, nrows - 1) * nsb + g);
+    const bool hiS = jj >= 2;
+    const uint32_t mA = hiS ? 0u : 0x3F3F3F3Fu, mC = hiS ? 0x0F0F0F0Fu : 0u, mS = hiS ? 0x30303030u : 0u;
+    const int bsel = 2 * (jj & 1);
+    const uint32_t mH = hf ? 0u : ~0u;
+    float sum[R][NC];
+#pragma unroll
+    for (int r = 0; r < R; r++)
+#pragma unroll
+        for (int c = 0; c < NC; c++) sum[r][c] = 0.0f;
+    for (int sb = g; sb < nsb; sb += 4) {
+        uint4 hd[R], qh[R], qs[R];
+#pragma unroll
+        for (int r = 0; r < R; r++) {
+            const uint4* p = base[r] + (sb - g) * U4;
+            hd[r] = __ldg(p);
+            qh[r] = KQ<BLK>::has_qh ? __ldg(p + 1 + hf) : make_uint4(0, 0, 0, 0);
+            qs[r] = __ldg(p + KQ<BLK>::qs_u4 + t);
+        }
+        const int yoff = sb * 256 + 64 * jj + 16 * hf;
+        const int soff = sb * 8 + 2 * jj;
+#pragma unroll
+        for (int r = 0; r < R; r++) {
+            uint32_t wl[8], wh[8];
+            const uint32_t qsw[4] = {qs[r].x, qs[r].y, qs[r].z, qs[r].w};
+            const uint32_t qhw[4] = {qh[r].x, qh[r].y, qh[r].z, qh[r].w};
+#pragma unroll
+            for (int k = 0; k < 4; k++) {
+                const uint32_t w = qsw[k], q = qhw[k] >> (2 * jj);
+                uint32_t vlo = w & 0x0F0F0F0Fu, vhi = (w >> 4) & 0x0F0F0F0Fu;
+                if constexpr (KQ<BLK>::has_qh) {
+                    vlo |= (q & 0x01010101u) << 4;
+                    vhi |= (q & 0x02020202u) << 3;
+                }
+                wl[2 * k] = __byte_perm(vlo, 0, 0x4140); wl[2 * k + 1] = __byte_perm(vlo, 0, 0x4342);
+                wh[2 * k] = __byte_perm(vhi, 0, 0x4140); wh[2 * k + 1] = __byte_perm(vhi, 0, 0x4342);
+            }
+            const uint32_t A = hd[r].y, B = hd[r].z, C = hd[r].w;
+            const uint32_t scw = (A & mA) | (C & mC) | ((A >> 2) & mS);
+            const uint32_t mw = ((B & mA) | ((C >> 4) & mC) | ((B >> 2) & mS)) & mH;
+            const float2 dm = __half22float2(*(const half2*) &hd[r].x);
+            const float sc0 = dm.x * byte_f(scw, bsel), sc1 = dm.x * byte_f(scw, bsel + 1);
+            const float m0 = dm.y * byte_f(mw, bsel), m1 = dm.y * byte_f(mw, bsel + 1);
+#pragma unroll
+            for (int c = 0; c < NC; c++) {
+                const uint4* yp = (const uint4*) (y + (int64_t) c * K + yoff);
+                const uint4 y0 = __ldg(yp), y1 = __ldg(yp + 1), y2 = __ldg(yp + 4), y3 = __ldg(yp + 5);
+                const float4 s4 = __ldg((const float4*) (ys + (int64_t) c * (K / 32) + soff));
+                const half2* YL0 = (const half2*) &y0; const half2* YL1 = (const half2*) &y1;
+                const half2* YH0 = (const half2*) &y2; const half2* YH1 = (const half2*) &y3;
+                half2 al = __float2half2_rn(0.0f), ah = al;
+#pragma unroll
+                for (int k = 0; k < 4; k++) {
+                    al = __hfma2(*(const half2*) &wl[k], YL0[k], al);
+                    al = __hfma2(*(const half2*) &wl[4 + k], YL1[k], al);
+                    ah = __hfma2(*(const half2*) &wh[k], YH0[k], ah);
+                    ah = __hfma2(*(const half2*) &wh[4 + k], YH1[k], ah);
+                }
+                const float sl = __half2float(__hadd(__low2half(al), __high2half(al)));
+                const float sh = __half2float(__hadd(__low2half(ah), __high2half(ah)));
+                float acc = sum[r][c];
+                acc = fmaf(sc0, sl * s4.x, acc);
+                acc = fmaf(sc1, sh * s4.z, acc);
+                acc = fmaf(-m0, s4.y, acc);
+                sum[r][c] = fmaf(-m1, s4.w, acc);
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < R; r++)
+#pragma unroll
+        for (int c = 0; c < NC; c++) {
+            float v = sum[r][c];
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+            if (lane == 0 && row0 + r < nrows) dst[(int64_t) c * nrows + row0 + r] = v;
+        }
+}
+
+// IQ4_XS: thread t of a group owns sub-block t; the table is stored +128 (1..241, fits a subnormal half) and the
+// 128 * sum(x) it adds is removed in fp32 with the exact block sum. 136-byte blocks are 8-byte aligned: uint2 loads.
+template<int R, int NC>
+__global__ void __launch_bounds__(128) iq4_xs_nc(const IQ4XSBlock* __restrict__ W, const half* __restrict__ y,
+                                                 const float2* __restrict__ ys, float* __restrict__ dst, int nrows, int nsb) {
+    constexpr int U2 = sizeof(IQ4XSBlock) / sizeof(uint2);   // 17
+    constexpr uint32_t T0 = 0x3F2D1801u, T1 = 0x766A5D4Fu, T2 = 0xA6998D81u, T3 = 0xF1D9C5B5u;
+    const int K = nsb * 256;
+    const int lane = int(threadIdx.x) % 32;
+    const int row0 = (int(blockIdx.x) * 4 + int(threadIdx.x) / 32) * R;
+    const int g = lane / 8, t = lane % 8;
+    const uint2* base[R];
+#pragma unroll
+    for (int r = 0; r < R; r++) base[r] = (const uint2*) (W + (int64_t) min(row0 + r, nrows - 1) * nsb + g);
+    float sum[R][NC];
+#pragma unroll
+    for (int r = 0; r < R; r++)
+#pragma unroll
+        for (int c = 0; c < NC; c++) sum[r][c] = 0.0f;
+    for (int sb = g; sb < nsb; sb += 4) {
+        uint2 hd[R], q0[R], q1[R];
+#pragma unroll
+        for (int r = 0; r < R; r++) {
+            const uint2* p = base[r] + (sb - g) * U2;
+            hd[r] = __ldg(p);
+            q0[r] = __ldg(p + 1 + 2 * t);
+            q1[r] = __ldg(p + 2 + 2 * t);
+        }
+#pragma unroll
+        for (int r = 0; r < R; r++) {
+            uint32_t wv[16];
+            const uint32_t qw[4] = {q0[r].x, q0[r].y, q1[r].x, q1[r].y};
+#pragma unroll
+            for (int k = 0; k < 4; k++) {
+                const uint32_t q = qw[k];
+                const uint32_t qx = q ^ 0x88888888u;
+                const uint32_t S = ((q >> 1) & 0x44444444u) | 0x32103210u;
+                const uint32_t v0 = prmt(prmt(T0, T1, q), prmt(T2, T3, qx), S);
+                const uint32_t v1 = prmt(prmt(T0, T1, q >> 16), prmt(T2, T3, qx >> 16), S >> 16);
+                wv[2 * k] = __byte_perm(v0, 0, 0x4240);
+                wv[2 * k + 1] = __byte_perm(v1, 0, 0x4240);
+                wv[8 + 2 * k] = __byte_perm(v0, 0, 0x4341);
+                wv[8 + 2 * k + 1] = __byte_perm(v1, 0, 0x4341);
+            }
+            const int ls = ((hd[r].y >> (4 * t)) & 0xF) | (((hd[r].x >> (16 + 2 * t)) & 3) << 4);
+            const float dl = __half2float(__ushort_as_half((unsigned short) (hd[r].x & 0xFFFF))) * (float) (ls - 32);
+#pragma unroll
+            for (int c = 0; c < NC; c++) {
+                const uint4* yp = (const uint4*) (y + (int64_t) c * K + sb * 256 + 32 * t);
+                const uint4 yv[4] = {__ldg(yp), __ldg(yp + 1), __ldg(yp + 2), __ldg(yp + 3)};
+                const float2 sc = __ldg(ys + (int64_t) c * (K / 32) + sb * 8 + t);
+                const half2* Y = (const half2*) yv;
+                half2 acc = __float2half2_rn(0.0f);
+#pragma unroll
+                for (int i = 0; i < 16; i++) acc = __hfma2(*(const half2*) &wv[i], Y[i], acc);
+                const float sv = __half2float(__hadd(__low2half(acc), __high2half(acc)));
+                sum[r][c] += dl * fmaf(sv, sc.x, -128.0f * sc.y);
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < R; r++)
+#pragma unroll
+        for (int c = 0; c < NC; c++) {
+            float v = sum[r][c];
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+            if (lane == 0 && row0 + r < nrows) dst[(int64_t) c * nrows + row0 + r] = v;
+        }
+}
+
+// Q6_K: 210-byte blocks are 2-byte aligned, so a warp's 4 consecutive blocks of a row are staged with coalesced 16-byte
+// loads and read back with funnel shifts. Thread t of a group owns half n = t/4 and positions 8(t%4)..+7 of the four
+// 32-runs of that half; q (0..63) is a subnormal half and the -32 is removed in fp32 with the per-16 sums.
+template<int R, int NC>
+__global__ void __launch_bounds__(128) q6_K_nc(const Q6KBlock* __restrict__ W, const half* __restrict__ y,
+                                               const float2* __restrict__ ys, const float* __restrict__ s16,
+                                               float* __restrict__ dst, int nrows, int nsb) {
+    const int K = nsb * 256;
+    constexpr int STAGE_U4 = 56;   // >= (15 + 4 * 210 + 15) / 16
+    __shared__ uint4 stage[4][R][STAGE_U4];
+    const int lane = int(threadIdx.x) % 32, warp = int(threadIdx.x) / 32;
+    const int row0 = (int(blockIdx.x) * 4 + warp) * R;
+    const int g = lane / 8, t = lane % 8, n = t / 4, c4 = t % 4, i0 = c4 / 2;
+    const float offm = (c4 & 1) ? 0.0f : -32.0f;
+    const uint4* gp[R];
+    int mis[R];
+#pragma unroll
+    for (int r = 0; r < R; r++) {
+        const uintptr_t a = (uintptr_t) (W + (int64_t) min(row0 + r, nrows - 1) * nsb);
+        gp[r] = (const uint4*) (a & ~(uintptr_t) 15);
+        mis[r] = int(a & 15);
+    }
+    float sum[R][NC];
+#pragma unroll
+    for (int r = 0; r < R; r++)
+#pragma unroll
+        for (int c = 0; c < NC; c++) sum[r][c] = 0.0f;
+    const int nit = (nsb + 3) / 4;
+    for (int it = 0; it < nit; it++) {
+        const int sb = 4 * it + g;
+        const bool act = sb < nsb;
+        const int sbc = act ? sb : nsb - 1;
+        const int nblk = min(nsb - 4 * it, 4);
+        int m[R];
+        uint4 v0[R], v1[R];
+#pragma unroll
+        for (int r = 0; r < R; r++) {
+            const int off = mis[r] + 840 * it;
+            const uint4* src = gp[r] + (off >> 4);
+            m[r] = off & 15;
+            const int nu4 = (m[r] + 210 * nblk + 15) >> 4;
+            v0[r] = lane < nu4 ? __ldg(src + lane) : make_uint4(0, 0, 0, 0);
+            v1[r] = lane + 32 < nu4 ? __ldg(src + lane + 32) : make_uint4(0, 0, 0, 0);
+        }
+        __syncwarp();
+#pragma unroll
+        for (int r = 0; r < R; r++) {
+            stage[warp][r][lane] = v0[r];
+            if (lane + 32 < STAGE_U4) stage[warp][r][lane + 32] = v1[r];
+        }
+        __syncwarp();
+        float rsc[NC][4], soc[NC][4];
+#pragma unroll
+        for (int c = 0; c < NC; c++) {
+            const float2* ysc = ys + (int64_t) c * (K / 32);
+            const float4 rs01 = __ldg((const float4*) (ysc + sbc * 8 + 4 * n));
+            const float4 rs23 = __ldg((const float4*) (ysc + sbc * 8 + 4 * n + 2));
+            rsc[c][0] = rs01.x; rsc[c][1] = rs01.z; rsc[c][2] = rs23.x; rsc[c][3] = rs23.z;
+            const float* sp = s16 + (int64_t) c * (K / 16) + sbc * 16 + 8 * n + i0;
+#pragma unroll
+            for (int mm = 0; mm < 4; mm++) soc[c][mm] = __ldg(sp + 2 * mm) * offm;
+        }
+#pragma unroll
+        for (int r = 0; r < R; r++) {
+            const uint8_t* bb = (const uint8_t*) &stage[warp][r][0] + m[r] + 210 * g;
+            const uint32_t* w = (const uint32_t*) ((uintptr_t) bb & ~(uintptr_t) 3);
+            const uint32_t shf = uint32_t((uintptr_t) bb & 3) * 8;
+            auto ld8 = [&](int byteoff) {
+                const uint32_t* q = w + byteoff / 4;
+                return make_uint2(__funnelshift_r(q[0], q[1], shf), __funnelshift_r(q[1], q[2], shf));
+            };
+            const uint2 L0 = ld8(64 * n + 8 * c4);
+            const uint2 L1 = ld8(64 * n + 32 + 8 * c4);
+            const uint2 QH = ld8(128 + 32 * n + 8 * c4);
+            const uint2 SC = ld8(192 + 8 * n);
+            const uint32_t DW = __funnelshift_r(w[52], w[53], shf);
+            uint32_t wv[4][4];
+            const uint32_t l0w[2] = {L0.x, L0.y}, l1w[2] = {L1.x, L1.y}, hw[2] = {QH.x, QH.y};
+#pragma unroll
+            for (int k = 0; k < 2; k++) {
+                const uint32_t a = l0w[k], b = l1w[k], h = hw[k];
+                const uint32_t v[4] = {(a & 0x0F0F0F0Fu) | ((h & 0x03030303u) << 4),
+                                       (b & 0x0F0F0F0Fu) | ((h & 0x0C0C0C0Cu) << 2),
+                                       ((a >> 4) & 0x0F0F0F0Fu) | (h & 0x30303030u),
+                                       ((b >> 4) & 0x0F0F0F0Fu) | ((h >> 2) & 0x30303030u)};
+#pragma unroll
+                for (int mm = 0; mm < 4; mm++) {
+                    wv[mm][2 * k] = __byte_perm(v[mm], 0, 0x4140);
+                    wv[mm][2 * k + 1] = __byte_perm(v[mm], 0, 0x4342);
+                }
+            }
+            const float sc[4] = {s8_f(SC.x, i0), s8_f(SC.x, i0 + 2), s8_f(SC.y, i0), s8_f(SC.y, i0 + 2)};
+            const float dd = __half2float(__ushort_as_half((unsigned short) (DW & 0xFFFF)));
+#pragma unroll
+            for (int c = 0; c < NC; c++) {
+                const uint4* yp = (const uint4*) (y + (int64_t) c * K + sbc * 256 + 128 * n + 8 * c4);
+                const uint4 yv[4] = {__ldg(yp), __ldg(yp + 4), __ldg(yp + 8), __ldg(yp + 12)};
+                float sacc = 0.0f;
+#pragma unroll
+                for (int mm = 0; mm < 4; mm++) {
+                    const half2* Y = (const half2*) &yv[mm];
+                    half2 acc = __float2half2_rn(0.0f);
+#pragma unroll
+                    for (int i = 0; i < 4; i++) acc = __hfma2(*(const half2*) &wv[mm][i], Y[i], acc);
+                    sacc = fmaf(sc[mm], fmaf(__half2float(__hadd(__low2half(acc), __high2half(acc))), rsc[c][mm], soc[c][mm]), sacc);
+                }
+                if (act) sum[r][c] = fmaf(dd, sacc, sum[r][c]);
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < R; r++)
+#pragma unroll
+        for (int c = 0; c < NC; c++) {
+            float v = sum[r][c];
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+            if (lane == 0 && row0 + r < nrows) dst[(int64_t) c * nrows + row0 + r] = v;
+        }
+}
+
+// per-stream scratch (the fp16 activations and their scales): concurrent streams on one card each get their own
+struct Scratch { half* y = nullptr; float2* ys = nullptr; float* s16 = nullptr; int cap_k = 0; };
+constexpr int MAX_K = 32768;
+inline Scratch* scratch_for(cudaStream_t s) {
+    static std::mutex mu;
+    static std::unordered_map<cudaStream_t, Scratch> map;
+    std::lock_guard<std::mutex> lk(mu);
+    Scratch& sc = map[s];
+    if (sc.cap_k == 0) {
+        // the engine records its decode into CUDA graphs (thread-local capture), where cudaMalloc is refused: the
+        // one-time allocation enqueues nothing, so it runs in relaxed mode and the graph keeps the pointers
+        cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
+        cudaThreadExchangeStreamCaptureMode(&mode);
+        const bool ok = cudaMalloc(&sc.y, sizeof(half) * MAX_NCOLS * MAX_K) == cudaSuccess &&
+                        cudaMalloc(&sc.ys, sizeof(float2) * MAX_NCOLS * (MAX_K / 32)) == cudaSuccess &&
+                        cudaMalloc(&sc.s16, sizeof(float) * MAX_NCOLS * (MAX_K / 16)) == cudaSuccess;
+        cudaThreadExchangeStreamCaptureMode(&mode);
+        if (!ok) {
+            cudaGetLastError();
+            return nullptr;
+        }
+        sc.cap_k = MAX_K;
+    }
+    return &sc;
+}
+
+// STRATA_B6_F16=1: every 2..8-column dense GEMV of the four formats; STRATA_B6_F16=head: only the verify head's
+// (the caller opens head_scope around it).  0 = off, 1 = all, 2 = head only.
+inline int mode() {
+    static const int v = [] {
+        const char* e = std::getenv("STRATA_B6_F16");
+        int m = !e ? 0 : std::strcmp(e, "1") == 0 ? 1 : std::strcmp(e, "head") == 0 ? 2 : 0;
+        if (m) {
+            int dev = 0, major = 0, minor = 0;
+            cudaGetDevice(&dev);
+            cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+            cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
+            if (!(major == 6 && minor == 0)) m = 0;
+            std::fprintf(stderr, "strata b6 f16: %s\n", m == 1 ? "GP100 fp16 dense GEMVs (Q4_K/Q5_K/Q6_K/IQ4_XS, 2..8 cols)"
+                                                       : m == 2 ? "GP100 fp16 GEMV for the verify head only"
+                                                                : "STRATA_B6_F16 ignored (not compute capability 6.0)");
+        }
+        return m;
+    }();
+    return v;
+}
+inline bool& head_scope() { static thread_local bool v = false; return v; }
+inline bool on() { const int m = mode(); return m == 1 || (m == 2 && head_scope()); }
+inline bool check_on() {
+    static const bool v = [] { const char* e = std::getenv("STRATA_B6_F16_CHECK"); return e && e[0] == '1'; }();
+    return v;
+}
+
+template<typename BLK> constexpr bool kTyped = std::is_same_v<BLK, Q4KBlock> || std::is_same_v<BLK, Q5KBlock> ||
+                                               std::is_same_v<BLK, Q6KBlock> || std::is_same_v<BLK, IQ4XSBlock>;
+
+// true when it ran; R = 4 rows per warp, 16 rows per block (llama.cpp's in-situ pick at 4 columns)
+template<typename BLK, int NC>
+bool launch(const BLK* w, const Q81Block* x, float* y, int n_in, int n_out, cudaStream_t s) {
+    if constexpr (!kTyped<BLK>) {
+        return false;
+    } else {
+        if (!on() || n_in % 256 != 0 || n_in > MAX_K) return false;
+        Scratch* sc = scratch_for(s);
+        if (sc == nullptr) return false;
+        const int nb = NC * (n_in / 32);   // the columns are contiguous q8_1 blocks: x + j * (n_in / 32)
+        prep_q81<<<unsigned((nb + 3) / 4), 128, 0, s>>>(x, sc->y, sc->ys, sc->s16, nb);
+        constexpr int R = 4;
+        const int nsb = n_in / 256;
+        const unsigned blocks = unsigned((n_out + 4 * R - 1) / (4 * R));
+        if constexpr (std::is_same_v<BLK, Q6KBlock>)
+            q6_K_nc<R, NC><<<blocks, 128, 0, s>>>(w, sc->y, sc->ys, sc->s16, y, n_out, nsb);
+        else if constexpr (std::is_same_v<BLK, IQ4XSBlock>)
+            iq4_xs_nc<R, NC><<<blocks, 128, 0, s>>>(w, sc->y, sc->ys, y, n_out, nsb);
+        else
+            kq_nc<BLK, R, NC><<<blocks, 128, 0, s>>>(w, sc->y, sc->ys, y, n_out, nsb);
+        return true;
+    }
+}
+
+}  // namespace gp100b6

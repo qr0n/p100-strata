@@ -1,0 +1,259 @@
+From 57f30dd14aca190d248c101f7379a7347ec12e1f Mon Sep 17 00:00:00 2001
+From: qr0n <77075118+qr0n@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 02:11:56 +0000
+Subject: [PATCH 08/12] p100: STRATA_SM60_D20_SUB=1 (IQ4_NL down on the 8-lane
+ rows) and STRATA_DOWN_F16=1 (Q2_0 down in fp16)
+
+On sm_60 mode 8 sent both down formats to native_down_lds_kernel. For IQ4_NL the
+CUDA layout's 8-lane K=640 rows are faster and bitwise equal (expdec_bench,
+20 groups: T=2 92.9 -> 72.5 us, T=4 135.8 -> 90.7). For Q2_0 a new
+down_f16_q2_0_kernel: 4 lanes per row (5 calls each, no idle lanes), codes as
+subnormal half2 + 16 HFMA2 per call and entry, the -1 offset taken once per
+call from the exactly staged sum(q): T=1 39.1 -> 26.8 us, T=4 110.2 -> 62.4,
+output rel. RMS 8e-8 vs the int8 path. Both opt-in; expdec_bench choices d20,
+d16, all16.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/strata/kernels/iq_kernels.hpp |   4 +
+ src/kernels/cuda/iq_kernels.cu        | 149 +++++++++++++++++++++++++-
+ src/kernels/expdec_bench.cpp          |  13 ++-
+ 3 files changed, 163 insertions(+), 3 deletions(-)
+
+diff --git a/include/strata/kernels/iq_kernels.hpp b/include/strata/kernels/iq_kernels.hpp
+index 58e700ba..4990cd91 100644
+--- a/include/strata/kernels/iq_kernels.hpp
++++ b/include/strata/kernels/iq_kernels.hpp
+@@ -104,6 +104,10 @@ const float* hadamard_device_signs(const float* host, int width);
+ void native_expert_set_expdec(int on);
+ // GP100 fp16 gate/up (STRATA_GU_F16): 1 on, 0 off, -1 the environment; sm_60 only, not bitwise the int8 path
+ void native_expert_set_gu_f16(int on);
++// GP100 IQ4_NL down on the 8-lane rows (STRATA_SM60_D20_SUB): 1 on, 0 off, -1 the environment
++void native_expert_set_sm60_d20(int on);
++// GP100 fp16 Q2_0 down (STRATA_DOWN_F16): 1 on, 0 off, -1 the environment; not bitwise
++void native_expert_set_down_f16(int on);
+ int native_expert_expdec();
+ /// Its knobs, read from the environment at startup (STRATA_EXPDEC_R 1 | 2, _DR 1 | 2 | 4, _MINB 2 | 4, _D20 0 | 1,
+ /// _RB, _DRB, _MINBLK): gate/up and down rows per lane, the gate/up kernel's __launch_bounds__ minimum blocks per SM
+diff --git a/src/kernels/cuda/iq_kernels.cu b/src/kernels/cuda/iq_kernels.cu
+index 07cceb8d..fda78d75 100644
+--- a/src/kernels/cuda/iq_kernels.cu
++++ b/src/kernels/cuda/iq_kernels.cu
+@@ -5292,6 +5292,117 @@ __global__ void __launch_bounds__(256, 3) gu_f16_gp100_kernel(const unsigned lon
+     }
+ }
+ 
++// ---- GP100 (STRATA_DOWN_F16=1): the Q2_0 down (n_ff 640) in fp16.  Mode 8's down kernel runs one row per warp over
++// the row's 20 calls (12 of 32 lanes idle) with 32 VMADs per call and entry; here 4 lanes take a row (5 calls each, 8
++// rows a warp, 64 a block) and each call's 32 codes (value = code - 1) become 16 subnormal half2 (the code 0..3 as
++// code * 2^-24) applied with 16 HFMA2; the -1 is taken off once per call as -sum(q), staged exactly with the entry.
++// Activation reads are broadcast over the 8 rows of a warp (lanes with the same call read the same words).
++constexpr int D16_NT = 4;   // entries staged at once
++
++// raw PRMT: selector bit 3 = replicate the sign of the selected byte (0x00 for the code bytes here)
++__device__ __forceinline__ uint32_t d16_prmt(uint32_t a, uint32_t b, uint32_t c) {
++    uint32_t r;
++    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(r) : "r"(a), "r"(b), "r"(c));
++    return r;
++}
++// x = 16 sequential 2-bit codes -> 8 half2 (codes 2m, 2m + 1 as subnormal halves)
++__device__ __forceinline__ void d16_codes(uint32_t x, uint32_t* w) {
++    const uint32_t A = x & 0x33333333u, B = (x >> 2) & 0x33333333u;   // per nibble: the even code, the odd code
++    const uint32_t Alo = A & 0x0F0F0F0Fu, Ahi = (A >> 4) & 0x0F0F0F0Fu, Blo = B & 0x0F0F0F0Fu, Bhi = (B >> 4) & 0x0F0F0F0Fu;
++#pragma unroll
++    for (int b = 0; b < 4; ++b) {
++        const uint32_t sel = 0x8080u | (uint32_t) b | ((uint32_t) (4 + b) << 8);
++        w[2 * b + 0] = d16_prmt(Alo, Blo, sel);   // nibble 2b
++        w[2 * b + 1] = d16_prmt(Ahi, Bhi, sel);   // nibble 2b + 1
++    }
++}
++
++__global__ void __launch_bounds__(256, 4) down_f16_q2_0_kernel(const unsigned long long* __restrict__ grp_ptr,
++                                                               const int32_t* __restrict__ grp_start,
++                                                               const int32_t* __restrict__ n_groups,
++                                                               const int32_t* __restrict__ ent_dst,
++                                                               const block_q8_1* __restrict__ hq, NativeExpertLayout L,
++                                                               float* __restrict__ out) {
++    constexpr int NC = 20;   // calls of a row (n_ff 640 / 32), 5 per lane
++    __shared__ uint4 sx[D16_NT][4][NC];
++    __shared__ float sd[D16_NT][NC], sq[D16_NT][NC];
++    const int g = blockIdx.y;
++    if (g >= *n_groups) return;
++    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, t = lane & 3;
++    const uint8_t* blob = (const uint8_t*) grp_ptr[g];
++    const int e0 = grp_start[g], e1 = grp_start[g + 1];
++    const int row = blockIdx.x * 64 + warp * 8 + (lane >> 2);
++    const bool live = row < (int) L.n_embd;
++    const block_q2_0* wr = (const block_q2_0*) (blob + L.down_off + (size_t) (live ? row : 0) * L.d_row);
++    for (int c0 = e0; c0 < e1; c0 += D16_NT) {
++        const int cn = min(D16_NT, e1 - c0);
++        __syncthreads();
++        for (int i = tid; i < cn * NC * 16; i += 256) {   // q8_1 -> fp16, plane layout [j][word / 4][call]
++            const int j = i / (NC * 16), k = (i / 16) % NC, w = i & 15;
++            const block_q8_1* src = hq + (size_t) (c0 + j) * NC + k;
++            const char2 q = *reinterpret_cast<const char2*>(&src->qs[2 * w]);
++            const half2 h = __halves2half2(__short2half_rn(q.x), __short2half_rn(q.y));
++            reinterpret_cast<uint32_t*>(&sx[j][w >> 2][k])[w & 3] = *reinterpret_cast<const uint32_t*>(&h);
++        }
++        for (int i = tid; i < cn * NC; i += 256) {
++            const int j = i / NC, k = i % NC;
++            const block_q8_1* src = hq + (size_t) (c0 + j) * NC + k;
++            int s = 0;
++#pragma unroll
++            for (int b = 0; b < 32; ++b) s += src->qs[b];
++            sd[j][k] = __low2float(src->ds);
++            sq[j][k] = (float) s;
++        }
++        __syncthreads();
++        float acc[D16_NT] = {};
++#pragma unroll
++        for (int ci = 0; ci < NC / 4; ++ci) {
++            const int c = t + 4 * ci, kbx = c >> 1, iqs = c & 1;
++            const block_q2_0* b = wr + kbx;
++            const uint16_t* q16 = (const uint16_t*) b->qs + iqs * 4;
++            uint32_t w[16];
++            d16_codes((uint32_t) q16[0] | ((uint32_t) q16[1] << 16), w);
++            d16_codes((uint32_t) q16[2] | ((uint32_t) q16[3] << 16), w + 8);
++            const float d2 = __half2float(b->d);
++#pragma unroll
++            for (int j = 0; j < D16_NT; ++j) {
++                if (j < cn) {
++                    const uint4 x4[4] = {sx[j][0][c], sx[j][1][c], sx[j][2][c], sx[j][3][c]};
++                    const uint32_t* x = (const uint32_t*) x4;
++                    half2 a0 = __float2half2_rn(0.0f), a1 = a0;
++#pragma unroll
++                    for (int m = 0; m < 8; ++m)
++                        a0 = __hfma2(*reinterpret_cast<const half2*>(&w[m]), *reinterpret_cast<const half2*>(&x[m]), a0);
++#pragma unroll
++                    for (int m = 8; m < 16; ++m)
++                        a1 = __hfma2(*reinterpret_cast<const half2*>(&w[m]), *reinterpret_cast<const half2*>(&x[m]), a1);
++                    const float2 f0 = __half22float2(a0), f1 = __half22float2(a1);
++                    acc[j] += d2 * sd[j][c] * (kF16Unit * ((f0.x + f0.y) + (f1.x + f1.y)) - sq[j][c]);
++                }
++            }
++        }
++#pragma unroll
++        for (int j = 0; j < D16_NT; ++j) {
++            if (j < cn) {
++                float v = acc[j];
++                v += __shfl_xor_sync(0xffffffffu, v, 1);
++                v += __shfl_xor_sync(0xffffffffu, v, 2);
++                if (t == 0 && live) out[(size_t) ent_dst[c0 + j] * L.n_embd + row] = v;
++            }
++        }
++    }
++}
++int g_down_f16 = -1;   // native_expert_set_down_f16 (the bench); -1 = STRATA_DOWN_F16
++bool down_f16_on(const NativeExpertLayout& L) {
++    static const bool env = env_on("STRATA_DOWN_F16");
++    if (L.d_type != 42 || L.n_ff != 640 || !(g_down_f16 >= 0 ? g_down_f16 == 1 : env)) return false;
++    int dev = 0, major = 0, minor = 0;
++    if (cudaGetDevice(&dev) != cudaSuccess) return false;
++    cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
++    cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
++    return major == 6 && minor == 0;
++}
++
+ // STRATA_GU_F16=1 on a compute capability 6.0 card: gu_f16_gp100_kernel for the five grid formats (off by default)
+ int g_gu_f16 = -1;   // native_expert_set_gu_f16 (the bench); -1 = STRATA_GU_F16
+ bool gu_f16_on() {
+@@ -5317,6 +5428,12 @@ void launch_gu_f16(const NativeExpertLayout& L, int64_t cap_groups, cudaStream_t
+     const dim3 gl((unsigned) (L.n_ff / 32), (unsigned) cap_groups);
+     gu_f16_gp100_kernel<TG><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq);
+ }
++#else
++bool gu_f16_on() { return false; }
++bool down_f16_on(const NativeExpertLayout&) { return false; }
++template<int TG>
++void launch_gu_f16(const NativeExpertLayout&, int64_t, cudaStream_t, const unsigned long long*, const int32_t*, const int32_t*,
++                   const int32_t*, const block_q8_1*, block_q8_1*) {}
+ #endif
+ 
+ int g_exp_mode = -1;   // native_expert_set_mode (the bench); -1 = STRATA_EXP_MODE, else the card's default
+@@ -5372,6 +5489,28 @@ int sm75_down_em(int em0, int64_t cap_groups) {
+ #else
+ int sm75_down_em(int em0, int64_t) { return em0; }
+ #endif
++// GP100 (STRATA_SM60_D20_SUB=1): the IQ4_NL down takes the CUDA layout's 8-lane K=640 rows instead of mode 8's LDS
++// kernel (expdec_bench, P100, 20 groups: 92.9 -> 72.4 us at T=2, 135.3 -> 90.7 at T=4); Q2_0 keeps mode 8 (faster there)
++int g_sm60_d20 = -1;   // native_expert_set_sm60_d20 (the bench); -1 = the environment
++#if STRATA_EXP_LAYOUTS && !defined(__HIPCC__)
++int sm60_down_em(int em0d, const NativeExpertLayout& L) {
++    static const bool env = env_on("STRATA_SM60_D20_SUB");
++    if (em0d != 8 || L.d_type != 20 || L.n_ff != 640 || !(g_sm60_d20 >= 0 ? g_sm60_d20 == 1 : env)) return em0d;
++    int dev = 0, major = 0, minor = 0;
++    if (cudaGetDevice(&dev) != cudaSuccess) return em0d;
++    cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
++    cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
++    return major == 6 && minor == 0 ? 0 : em0d;
++}
++#else
++int sm60_down_em(int em0d, const NativeExpertLayout&) { return em0d; }
++#endif
++void native_expert_set_sm60_d20(int on) { g_sm60_d20 = on; }
++#if !defined(__HIPCC__)
++void native_expert_set_down_f16(int on) { g_down_f16 = on; }
++#else
++void native_expert_set_down_f16(int) {}
++#endif
+ 
+ void native_expert_set_mode(int mode, int phase) {
+ #if STRATA_EXP_LAYOUTS
+@@ -5624,7 +5763,15 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
+     const int tq_ch = tq_sub8 ? tq_row_chunks() : 1;   // the staged trellis down kernel takes this many 32-row chunks a block
+     const dim3 gd((unsigned) (((L.n_embd + d_rows - 1) / d_rows + tq_ch - 1) / tq_ch), (unsigned) gy);
+ #if STRATA_EXP_LAYOUTS
+-    const int em0d = sm75_down_em(em0, cap_groups);
++    const int em0d = sm60_down_em(sm75_down_em(em0, cap_groups), L);
++    if ((em0d == 7 || em0d == 8) && L.d_type == 42 && down_f16_on(L)) {   // STRATA_DOWN_F16=1 (sm_60)
++        const dim3 gl((unsigned) ((L.n_embd + 63) / 64), (unsigned) cap_groups);
++#if !defined(__HIPCC__)
++        down_f16_q2_0_kernel<<<gl, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
++#endif
++        check("native_expert_grouped/down f16");
++        return;
++    }
+     if ((em0d == 7 || em0d == 8) && (L.d_type == 20 || L.d_type == 42)) {
+         const dim3 gl((unsigned) ((L.n_embd + LDS_RB - 1) / LDS_RB), (unsigned) cap_groups);
+         const size_t sh = (size_t) LDS_NT * (size_t) (L.n_ff / 32) * sizeof(block_q8_1);
+diff --git a/src/kernels/expdec_bench.cpp b/src/kernels/expdec_bench.cpp
+index c37621b8..c5a58377 100644
+--- a/src/kernels/expdec_bench.cpp
++++ b/src/kernels/expdec_bench.cpp
+@@ -65,7 +65,10 @@ int qk_of(int t) { return t == 20 ? 32 : t == 42 ? 64 : 256; }
+ struct Choice {
+     std::string name;
+     bool dec = false;
+-    bool f16 = false;   // "f16": the GP100 fp16 gate/up (not bitwise: compared by relative error)
++    int d20 = 0;        // "d20" / "f16d20": + the GP100 IQ4_NL down on the 8-lane rows
++    bool f16 = false;
++    bool f16_gu = true;   // f16: the gate/up too (false for d16)
++    bool d16 = false;   // "f16": the GP100 fp16 gate/up (not bitwise: compared by relative error)
+     K::NativeExpertExpdecParams p;   // every field set: the engine's startup values, then the choice's fields
+ };
+ K::NativeExpertExpdecParams g_engine_params;   // the engine's values at startup (environment or defaults)
+@@ -77,6 +80,10 @@ bool parse_choice(const std::string& s, Choice& c) {
+     c.p = g_engine_params;
+     if (s == "def") return true;
+     if (s == "f16") { c.f16 = true; return true; }
++    if (s == "d20") { c.d20 = 1; return true; }
++    if (s == "f16d20") { c.f16 = true; c.d20 = 1; return true; }
++    if (s == "d16") { c.f16 = true; c.f16_gu = false; c.d16 = true; return true; }   // fp16 Q2_0 down only
++    if (s == "all16") { c.f16 = true; c.d20 = 1; c.d16 = true; return true; }
+     if (s.rfind("dec", 0) != 0) return false;
+     c.dec = true;
+     size_t i = 3;
+@@ -105,7 +112,9 @@ bool parse_choice(const std::string& s, Choice& c) {
+ 
+ void apply_choice(const Choice& c) {
+     K::native_expert_set_expdec(c.dec ? 1 : 0);
+-    K::native_expert_set_gu_f16(c.f16 ? 1 : 0);
++    K::native_expert_set_gu_f16(c.f16 && c.f16_gu ? 1 : 0);
++    K::native_expert_set_down_f16(c.d16 ? 1 : 0);
++    K::native_expert_set_sm60_d20(c.d20);
+     K::native_expert_set_expdec_params(c.p);
+ }
+ 
+-- 
+2.53.0
+

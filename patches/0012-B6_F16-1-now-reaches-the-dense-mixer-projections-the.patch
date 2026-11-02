@@ -1,0 +1,35 @@
+From 05ac61bab0677fe70ceebf7552c64a3ae71778d8 Mon Sep 17 00:00:00 2001
+From: qr0n <77075118+qr0n@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 01:00:41 +0000
+Subject: [PATCH 12/12] B6_F16=1 now reaches the dense mixer projections: the
+ interleaved path declines the four fp16 formats at 2..8 columns
+
+Bench s1 decode (sc117 64k, peer): 60.6 -> 66.2 tok/s; GDN q8+qkv 8.31 -> 5.95 ms/window, QSA k/v 2.30 -> 1.93.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SNKxjYKWKzoaNichpJWKE9
+---
+ src/kernels/cuda/native_mmvq.cu | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/src/kernels/cuda/native_mmvq.cu b/src/kernels/cuda/native_mmvq.cu
+index 54460c6e..4c393b4c 100644
+--- a/src/kernels/cuda/native_mmvq.cu
++++ b/src/kernels/cuda/native_mmvq.cu
+@@ -3288,6 +3288,13 @@ void native_b6_f16_head_scope(bool) {}
+ 
+ bool native_mmvq_il_supported(int ggml_type, int ncols, int n_out) {
+     if (ncols < 1 || ncols > 8 || !g_multi_exact || !il_arch_ok()) return false;
++#if !defined(__HIPCC__)
++    // STRATA_B6_F16=1 (sm_60): the GP100 fp16 GEMV serves every 2..8-column Q4_K / Q5_K / Q6_K / IQ4_XS matrix.  This check
++    // used to come AFTER the interleaved path had taken them, so =1 never reached the dense mixer projections (p100-tp
++    // nvprof, 2026-11-01: the interleaved kernels ran the GDN qkv at ~90-140 GB/s).
++    if (gp100b6::mode() == 1 && ncols >= 2 && (ggml_type == 12 || ggml_type == 13 || ggml_type == 14 || ggml_type == 23))
++        return false;
++#endif
+     return (g_tune_rows ? g_tune_rows : il_rows(ggml_type, ncols, n_out)) != 0 &&
+            (ggml_type == 23 || ggml_type == 12 || ggml_type == 13 || ggml_type == 14 || ggml_type == 11);
+ }
+-- 
+2.53.0
+

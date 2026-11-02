@@ -102,6 +102,12 @@ const float* hadamard_device_signs(const float* host, int width);
 /// gate/up IQ2_XXS / IQ2_XS / IQ3_XXS / IQ3_S / IQ2_S at n_embd 2560 and down IQ4_NL / Q2_0 at n_ff 640; other layouts
 /// keep the default kernels.  Set before graph capture; captured graphs keep the kernels they captured.
 void native_expert_set_expdec(int on);
+// GP100 fp16 gate/up (STRATA_GU_F16): 1 on, 0 off, -1 the environment; sm_60 only, not bitwise the int8 path
+void native_expert_set_gu_f16(int on);
+// GP100 IQ4_NL down on the 8-lane rows (STRATA_SM60_D20_SUB): 1 on, 0 off, -1 the environment
+void native_expert_set_sm60_d20(int on);
+// GP100 fp16 Q2_0 down (STRATA_DOWN_F16): 1 on, 0 off, -1 the environment; not bitwise
+void native_expert_set_down_f16(int on);
 int native_expert_expdec();
 /// Its knobs, read from the environment at startup (STRATA_EXPDEC_R 1 | 2, _DR 1 | 2 | 4, _MINB 2 | 4, _D20 0 | 1,
 /// _RB, _DRB, _MINBLK): gate/up and down rows per lane, the gate/up kernel's __launch_bounds__ minimum blocks per SM

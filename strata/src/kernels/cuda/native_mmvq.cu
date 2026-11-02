@@ -49,6 +49,8 @@
 #include <unordered_map>
 #include <cstdio>
 #include <vector>
+#include <mutex>
+#include <cmath>
 
 namespace strata::kernels {
 namespace {
@@ -1471,10 +1473,53 @@ bool b6_launch(const typename F::Block* w, const Q81Block* x, float* y, int n_in
     }
 }
 
+#if !defined(__HIPCC__)
+#include "b6_f16_gp100.cuh"
+#endif
+template<typename F, int NCOLS>
+void launch_multi_n(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, cudaStream_t s);
+#if !defined(__HIPCC__)
+// STRATA_B6_F16_CHECK=1: the first call of each (format, shape, ncols) also runs the exact path and prints the error
+template<typename F, int NCOLS>
+void b6_f16_check(const void* weights, const void* x_q8_1, const float* y16, int n_in, int n_out, cudaStream_t s) {
+    static std::mutex mu;
+    static std::unordered_map<long long, int> seen;
+    cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(s, &st) != cudaSuccess || st != cudaStreamCaptureStatusNone) return;   // graphs: no sync
+    const long long key = (long long) n_in * 1000003LL + n_out;
+    { std::lock_guard<std::mutex> lk(mu); if (seen[key]++) return; }
+    float* ref = nullptr;
+    const std::size_t n = std::size_t(NCOLS) * n_out;
+    if (cudaMalloc(&ref, n * sizeof(float)) != cudaSuccess) { cudaGetLastError(); return; }
+    launch_multi_n<F, NCOLS>(weights, x_q8_1, ref, n_in, n_out, s);   // the exact path (b6_f16_inner is set)
+    std::vector<float> a(n), b(n);
+    cudaStreamSynchronize(s);
+    cudaMemcpy(a.data(), y16, n * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(b.data(), ref, n * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaFree(ref);
+    double e = 0, r = 0, mx = 0;
+    for (std::size_t i = 0; i < n; ++i) { const double d = double(a[i]) - b[i]; e += d * d; r += double(b[i]) * b[i]; mx = std::max(mx, std::fabs(d)); }
+    std::fprintf(stderr, "strata b6 f16 check: %s n_in %d n_out %d ncols %d: rel rms %.3e, max abs %.3e (ref rms %.3e)\n",
+                 std::is_same_v<typename F::Block, Q4KBlock> ? "Q4_K" : std::is_same_v<typename F::Block, Q5KBlock> ? "Q5_K"
+                 : std::is_same_v<typename F::Block, Q6KBlock> ? "Q6_K" : "IQ4_XS",
+                 n_in, n_out, NCOLS, std::sqrt(e / std::max(r, 1e-30)), mx, std::sqrt(r / double(n)));
+}
+template<typename F> inline bool& b6_f16_inner() { static thread_local bool v = false; return v; }
+#endif
 template<typename F, int NCOLS>
 void launch_multi_n(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, cudaStream_t s) {
     const auto* w = static_cast<const typename F::Block*>(weights);
     const auto* x = static_cast<const Q81Block*>(x_q8_1);
+#if !defined(__HIPCC__)
+    if (!b6_f16_inner<F>() && gp100b6::launch<typename F::Block, NCOLS>(w, x, y, n_in, n_out, s)) {   // STRATA_B6_F16
+        if (gp100b6::check_on()) {
+            b6_f16_inner<F>() = true;
+            b6_f16_check<F, NCOLS>(weights, x_q8_1, y, n_in, n_out, s);
+            b6_f16_inner<F>() = false;
+        }
+        return;
+    }
+#endif
     if (b6_launch<F, NCOLS>(w, x, y, n_in, n_out, s)) return;   // STRATA_B6_MMVQ_ROWS
     if (!g_multi_exact) {
         constexpr int NW = NCOLS <= 4 ? 4 : 2;
@@ -3229,8 +3274,27 @@ bool il_arch_ok() {
 }
 }  // namespace
 
+// STRATA_B6_F16=head: the verify head takes the GP100 fp16 multi-column GEMV instead of the interleaved path
+#if !defined(__HIPCC__)
+bool native_b6_f16_head(int ggml_type, int ncols) {
+    return gp100b6::mode() == 2 && ncols >= 2 && ncols <= 8 &&
+           (ggml_type == 12 || ggml_type == 13 || ggml_type == 14 || ggml_type == 23);
+}
+void native_b6_f16_head_scope(bool on) { gp100b6::head_scope() = on; }
+#else
+bool native_b6_f16_head(int, int) { return false; }
+void native_b6_f16_head_scope(bool) {}
+#endif
+
 bool native_mmvq_il_supported(int ggml_type, int ncols, int n_out) {
     if (ncols < 1 || ncols > 8 || !g_multi_exact || !il_arch_ok()) return false;
+#if !defined(__HIPCC__)
+    // STRATA_B6_F16=1 (sm_60): the GP100 fp16 GEMV serves every 2..8-column Q4_K / Q5_K / Q6_K / IQ4_XS matrix.  This check
+    // used to come AFTER the interleaved path had taken them, so =1 never reached the dense mixer projections (p100-tp
+    // nvprof, 2026-11-01: the interleaved kernels ran the GDN qkv at ~90-140 GB/s).
+    if (gp100b6::mode() == 1 && ncols >= 2 && (ggml_type == 12 || ggml_type == 13 || ggml_type == 14 || ggml_type == 23))
+        return false;
+#endif
     return (g_tune_rows ? g_tune_rows : il_rows(ggml_type, ncols, n_out)) != 0 &&
            (ggml_type == 23 || ggml_type == 12 || ggml_type == 13 || ggml_type == 14 || ggml_type == 11);
 }
@@ -3268,6 +3332,8 @@ void native_q8_1_interleave(const void*, void*, int, int, void*) {
     throw std::invalid_argument("native_q8_1_interleave is CUDA only");
 }
 bool native_mmvq_il_supported(int, int, int) { return false; }
+bool native_b6_f16_head(int, int) { return false; }
+void native_b6_f16_head_scope(bool) {}
 int native_mmvq_il_rows_for(int, int, int, int) { return 0; }
 void native_mmvq_il(int ggml_type, const void* weights, const void* x_q8_1, const void*, float* y, int n_in, int n_out,
                     int ncols, void* stream) {

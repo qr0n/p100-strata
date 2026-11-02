@@ -157,6 +157,9 @@ void native_quantize_q8_1_il(const float* x, void* x_q8_1, void* x_il, int n_in,
 void native_q8_1_interleave(const void* x_q8_1, void* x_il, int n_in, int ncols, void* stream);
 // True when native_mmvq_il runs its own kernel for this call (IQ4_XS, Q4_K, Q5_K, Q6_K, 2-4 columns, the exact layout).
 bool native_mmvq_il_supported(int ggml_type, int ncols, int n_out);
+// STRATA_B6_F16=head (sm_60): true when the verify head should run the fp16 GEMV (native_mmvq inside a head scope)
+bool native_b6_f16_head(int ggml_type, int ncols);
+void native_b6_f16_head_scope(bool on);
 // native_mmvq for 2..4 columns whose copy native_q8_1_interleave wrote, bitwise native_mmvq's output: kernels in which a
 // warp takes 1, 2 or 4 rows and reads the columns from the interleaved copy; native_mmvq (x_q8_1) when not supported.
 void native_mmvq_il(int ggml_type, const void* weights, const void* x_q8_1, const void* x_il, float* y, int n_in,

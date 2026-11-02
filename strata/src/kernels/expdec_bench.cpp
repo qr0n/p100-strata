@@ -65,6 +65,11 @@ int qk_of(int t) { return t == 20 ? 32 : t == 42 ? 64 : 256; }
 struct Choice {
     std::string name;
     bool dec = false;
+    int d20 = 0;        // "d20" / "f16d20": + the GP100 IQ4_NL down on the 8-lane rows
+    bool f16 = false;
+    bool f16_gu = true;   // f16: the gate/up too (false for d16)
+    int f16_ver = 1;      // "f16v2": STRATA_GU_F16=2
+    bool d16 = false;   // "f16": the GP100 fp16 gate/up (not bitwise: compared by relative error)
     K::NativeExpertExpdecParams p;   // every field set: the engine's startup values, then the choice's fields
 };
 K::NativeExpertExpdecParams g_engine_params;   // the engine's values at startup (environment or defaults)
@@ -75,6 +80,12 @@ bool parse_choice(const std::string& s, Choice& c) {
     c.name = s;
     c.p = g_engine_params;
     if (s == "def") return true;
+    if (s == "f16") { c.f16 = true; return true; }
+    if (s == "f16v2") { c.f16 = true; c.f16_ver = 2; return true; }
+    if (s == "d20") { c.d20 = 1; return true; }
+    if (s == "f16d20") { c.f16 = true; c.d20 = 1; return true; }
+    if (s == "d16") { c.f16 = true; c.f16_gu = false; c.d16 = true; return true; }   // fp16 Q2_0 down only
+    if (s == "all16") { c.f16 = true; c.d20 = 1; c.d16 = true; return true; }
     if (s.rfind("dec", 0) != 0) return false;
     c.dec = true;
     size_t i = 3;
@@ -103,6 +114,9 @@ bool parse_choice(const std::string& s, Choice& c) {
 
 void apply_choice(const Choice& c) {
     K::native_expert_set_expdec(c.dec ? 1 : 0);
+    K::native_expert_set_gu_f16(c.f16 && c.f16_gu ? c.f16_ver : 0);
+    K::native_expert_set_down_f16(c.d16 ? 1 : 0);
+    K::native_expert_set_sm60_d20(c.d20);
     K::native_expert_set_expdec_params(c.p);
 }
 
@@ -309,6 +323,16 @@ bool run_device(int dev, int reps, int groups_req, const std::vector<uint8_t>& p
                     long long nonfinite = 0;
                     for (float f : ref) nonfinite += std::isfinite(f) ? 0 : 1;
                     if (nonfinite) std::printf("# T=%d: %s output has %lld non-finite values\n", T, c.name.c_str(), nonfinite);
+                } else if (c.f16) {   // relative RMS error of the output against def's, and the worst element
+                    double num = 0.0, den = 0.0, worst = 0.0;
+                    for (size_t i = 0; i < ref.size(); ++i) {
+                        const double e = (double) res[i] - (double) ref[i];
+                        num += e * e; den += (double) ref[i] * ref[i];
+                        worst = std::max(worst, std::fabs(e));
+                    }
+                    std::printf("# T=%d f16: rel rms %.3e, max abs %.3e (ref rms %.3e)\n", T, std::sqrt(num / std::max(den, 1e-30)),
+                                worst, std::sqrt(den / (double) ref.size()));
+                    same = std::isfinite(num) && std::sqrt(num / std::max(den, 1e-30)) < 0.05;
                 } else {
                     same = std::memcmp(ref.data(), res.data(), ref.size() * sizeof(float)) == 0;
                 }

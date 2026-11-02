@@ -1,0 +1,209 @@
+From 19051084b3dc97d28fae76d90311c7a6f6814ffa Mon Sep 17 00:00:00 2001
+From: qr0n <77075118+qr0n@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 18:47:49 +0000
+Subject: [PATCH 10/12] p100: STRATA_GU_F16=2, gu_f16v2_gp100_kernel - v1's
+ fp16 gate/up decode on a 16-lane stride (no idle lanes) with induced block
+ pointers; expdec_bench choice f16v2
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/kernels/cuda/iq_kernels.cu | 137 ++++++++++++++++++++++++++++++++-
+ src/kernels/expdec_bench.cpp   |   4 +-
+ 2 files changed, 138 insertions(+), 3 deletions(-)
+
+diff --git a/src/kernels/cuda/iq_kernels.cu b/src/kernels/cuda/iq_kernels.cu
+index fda78d75..58399762 100644
+--- a/src/kernels/cuda/iq_kernels.cu
++++ b/src/kernels/cuda/iq_kernels.cu
+@@ -5407,7 +5407,7 @@ bool down_f16_on(const NativeExpertLayout& L) {
+ int g_gu_f16 = -1;   // native_expert_set_gu_f16 (the bench); -1 = STRATA_GU_F16
+ bool gu_f16_on() {
+     static const bool env = env_on("STRATA_GU_F16");
+-    if (!(g_gu_f16 >= 0 ? g_gu_f16 == 1 : env)) return false;
++    if (!(g_gu_f16 >= 0 ? g_gu_f16 >= 1 : env)) return false;
+     static int per_dev[64];   // 0 unknown, 1 no, 2 yes
+     int dev = 0;
+     if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return false;
+@@ -5428,8 +5428,133 @@ void launch_gu_f16(const NativeExpertLayout& L, int64_t cap_groups, cudaStream_t
+     const dim3 gl((unsigned) (L.n_ff / 32), (unsigned) cap_groups);
+     gu_f16_gp100_kernel<TG><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq);
+ }
++
++// ---- GP100 v2 (STRATA_GU_F16=2): gu_f16_gp100_kernel with the same decode and math (the same fp16 words, the same
++// per-call fp32 scaling; only the fp32 order of a row's sum differs), on a lane mapping that wastes nothing.  v1 runs
++// each warp over 4 passes of 2 rows with its 32 lanes striding the row's 80 calls: 3 steps a pass, the third with
++// lanes 16-31 idle - 1/6 of the decode's issue slots spent on nothing, and the kernel is issue-bound (P100: GP100 has
++// 2 schedulers a SM; PRMT and shifts are half rate).  Here lanes 0-15 take gate rows and 16-31 the matching up rows,
++// 2 rows a lane per pass, the 16 lanes striding the calls (n_embd 2560: 5 steps, all lanes busy), over 2 passes; a
++// lane's call index mod 8 is then fixed, so its block pointer just advances 2 blocks a step (no per-step address
++// arithmetic for the 64-bit field pointers).  The row sums close with 4 xor-shuffles inside each 16-lane half.
++template<int TG> struct F16Bs;
++template<> struct F16Bs<16> { static constexpr int v = sizeof(block_iq2_xxs); };
++template<> struct F16Bs<17> { static constexpr int v = sizeof(block_iq2_xs); };
++template<> struct F16Bs<18> { static constexpr int v = sizeof(block_iq3_xxs); };
++template<> struct F16Bs<21> { static constexpr int v = sizeof(block_iq3_s); };
++template<> struct F16Bs<22> { static constexpr int v = sizeof(block_iq2_s); };
++
++template<int TG>
++__global__ void __launch_bounds__(256, 3) gu_f16v2_gp100_kernel(const unsigned long long* __restrict__ grp_ptr,
++                                                                const int32_t* __restrict__ grp_start,
++                                                                const int32_t* __restrict__ n_groups,
++                                                                const int32_t* __restrict__ ent_tok,
++                                                                const block_q8_1* __restrict__ xq, NativeExpertLayout L,
++                                                                block_q8_1* __restrict__ hq) {
++    constexpr int BS = F16Bs<TG>::v;
++    extern __shared__ uint4 f16_sh[];
++    __shared__ float res[F16_NT][64];
++    const int g = blockIdx.y;
++    if (g >= *n_groups) return;
++    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, h = lane >> 4, kl = lane & 15;
++    const int xb = (int) (L.n_embd / 32), hb = (int) (L.n_ff / 32), ncall = xb;   // one call = one q8_1 block
++    uint32_t* tab = (uint32_t*) f16_sh;
++    uint4* sx = f16_sh + F16Tab<TG>::words / 4;                     // [F16_NT][4][xb]
++    float* sd = (float*) (sx + (size_t) F16_NT * 4 * xb);          // [F16_NT][xb]
++    F16Tab<TG>::copy(tab, tid);
++    const uint8_t* blob = (const uint8_t*) grp_ptr[g];
++    const int e0 = grp_start[g], e1 = grp_start[g + 1];
++    const int r0 = blockIdx.x * 32;
++    auto wrow = [&](int i) -> const uint8_t* {   // i < 32: gate row r0 + i, else up row r0 + i - 32
++        return blob + (i < 32 ? (size_t) 0 : L.up_off) + (size_t) (r0 + (i & 31)) * L.gu_row;
++    };
++    const int iqs = 2 * (kl & 7);   // this lane's call within a block: calls kl, kl + 16, ... are all = kl mod 8
++    for (int c0 = e0; c0 < e1; c0 += F16_NT) {
++        const int cn = min(F16_NT, e1 - c0);
++        __syncthreads();
++        for (int j = 0; j < cn; ++j) {   // q8_1 -> fp16: word w of call k = qs[2w], qs[2w + 1]
++            const block_q8_1* src = xq + (size_t) ent_tok[c0 + j] * xb;
++            uint32_t* dst = (uint32_t*) (sx + (size_t) j * 4 * xb);
++            for (int i = tid; i < xb * 16; i += 256) {
++                const int k = i >> 4, w = i & 15;
++                const char2 q = *reinterpret_cast<const char2*>(&src[k].qs[2 * w]);
++                const half2 hh = __halves2half2(__short2half_rn(q.x), __short2half_rn(q.y));
++                dst[((w >> 2) * xb + k) * 4 + (w & 3)] = *reinterpret_cast<const uint32_t*>(&hh);
++            }
++            for (int k = tid; k < xb; k += 256) sd[j * xb + k] = __low2float(src[k].ds);
++        }
++        __syncthreads();
++        for (int p = 0; p < 2; ++p) {
++            const int i0 = 32 * h + 16 * p + warp, i1 = i0 + 8;   // gate rows (h 0) or the same up rows (h 1)
++            const uint8_t* p0 = wrow(i0) + (kl >> 3) * BS;
++            const uint8_t* p1 = wrow(i1) + (kl >> 3) * BS;
++            float s0[F16_NT] = {}, s1[F16_NT] = {};
++#pragma unroll 1
++            for (int k = kl; k < ncall; k += 16, p0 += 2 * BS, p1 += 2 * BS) {
++                const F16W a = f16_decode<TG>(p0, 0, iqs, tab);
++                const F16W b = f16_decode<TG>(p1, 0, iqs, tab);
++#pragma unroll
++                for (int j = 0; j < F16_NT; ++j) {
++                    if (j < cn) {
++                        const uint4* xj = sx + (size_t) j * 4 * xb;
++                        const uint4 x4[4] = {xj[k], xj[xb + k], xj[2 * xb + k], xj[3 * xb + k]};
++                        const float d8 = sd[j * xb + k];
++                        s0[j] += f16_apply(a, x4, d8);
++                        s1[j] += f16_apply(b, x4, d8);
++                    }
++                }
++            }
++#pragma unroll
++            for (int j = 0; j < F16_NT; ++j) {
++                if (j < cn) {
++                    float a = s0[j], b = s1[j];
++#pragma unroll
++                    for (int o = 8; o > 0; o >>= 1) {
++                        a += __shfl_xor_sync(0xffffffffu, a, o);
++                        b += __shfl_xor_sync(0xffffffffu, b, o);
++                    }
++                    if (kl == 0) { res[j][i0] = a; res[j][i1] = b; }
++                }
++            }
++        }
++        __syncthreads();
++        if (warp < cn) {   // native_gu_fused_kernel's epilogue: SwiGLU + q8_1, one block of 32 h values per entry
++            const float gg = res[warp][lane], uu = res[warp][32 + lane];
++            const float xi = (gg / (1.0f + __expf(-gg))) * uu;
++            float amax = fabsf(xi), sum = xi;
++#pragma unroll
++            for (int o = 16; o > 0; o >>= 1) {
++                amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
++                sum += __shfl_xor_sync(0xffffffffu, sum, o);
++            }
++            const float d = q8_1_finite(amax / 127.0f);
++            const int8_t q = q8_1_quant(xi, d, amax);
++            block_q8_1* y = hq + (size_t) (c0 + warp) * hb + blockIdx.x;
++            y->qs[lane] = q;
++            if (lane == 0) y->ds = q8_1_ds(d, sum);
++        }
++    }
++}
++template<int TG>
++void launch_gu_f16v2(const NativeExpertLayout& L, int64_t cap_groups, cudaStream_t s, const unsigned long long* grp_ptr,
++                     const int32_t* grp_start, const int32_t* n_groups, const int32_t* ent_tok, const block_q8_1* X,
++                     block_q8_1* hq) {
++    const int xb = (int) (L.n_embd / 32);
++    const size_t sh = (size_t) F16Tab<TG>::words * 4 + (size_t) F16_NT * xb * (4 * sizeof(uint4) + sizeof(float));
++    const dim3 gl((unsigned) (L.n_ff / 32), (unsigned) cap_groups);
++    gu_f16v2_gp100_kernel<TG><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq);
++}
++// STRATA_GU_F16=2 picks gu_f16v2_gp100_kernel (1 = v1)
++int gu_f16_ver() {
++    static const int env = [] { const char* v = std::getenv("STRATA_GU_F16"); return v != nullptr && v[0] == '2' ? 2 : 1; }();
++    return g_gu_f16 >= 0 ? (g_gu_f16 == 2 ? 2 : 1) : env;
++}
+ #else
+ bool gu_f16_on() { return false; }
++int gu_f16_ver() { return 1; }
++template<int TG>
++void launch_gu_f16v2(const NativeExpertLayout&, int64_t, cudaStream_t, const unsigned long long*, const int32_t*, const int32_t*,
++                   const int32_t*, const block_q8_1*, block_q8_1*) {}
+ bool down_f16_on(const NativeExpertLayout&) { return false; }
+ template<int TG>
+ void launch_gu_f16(const NativeExpertLayout&, int64_t, cudaStream_t, const unsigned long long*, const int32_t*, const int32_t*,
+@@ -5653,7 +5778,15 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
+     const bool fused_gu = f16_gu || (em0 == 8 && ((kExpLds16 && L.gu_type == 16) || L.gu_type == 18 || L.gu_type == 21 || L.gu_type == 22 || L.gu_type == 23) &&
+                           L.n_ff % 32 == 0);
+     if (f16_gu && g_exp_phase != 2) {
+-        switch (L.gu_type) {
++        if (gu_f16_ver() == 2) {
++            switch (L.gu_type) {
++                case 16: launch_gu_f16v2<16>(L, cap_groups, s, grp_ptr, grp_start, n_groups, ent_tok, X, hq); break;
++                case 17: launch_gu_f16v2<17>(L, cap_groups, s, grp_ptr, grp_start, n_groups, ent_tok, X, hq); break;
++                case 18: launch_gu_f16v2<18>(L, cap_groups, s, grp_ptr, grp_start, n_groups, ent_tok, X, hq); break;
++                case 21: launch_gu_f16v2<21>(L, cap_groups, s, grp_ptr, grp_start, n_groups, ent_tok, X, hq); break;
++                default: launch_gu_f16v2<22>(L, cap_groups, s, grp_ptr, grp_start, n_groups, ent_tok, X, hq); break;
++            }
++        } else switch (L.gu_type) {
+             case 16: launch_gu_f16<16>(L, cap_groups, s, grp_ptr, grp_start, n_groups, ent_tok, X, hq); break;
+             case 17: launch_gu_f16<17>(L, cap_groups, s, grp_ptr, grp_start, n_groups, ent_tok, X, hq); break;
+             case 18: launch_gu_f16<18>(L, cap_groups, s, grp_ptr, grp_start, n_groups, ent_tok, X, hq); break;
+diff --git a/src/kernels/expdec_bench.cpp b/src/kernels/expdec_bench.cpp
+index c5a58377..7e5b54bf 100644
+--- a/src/kernels/expdec_bench.cpp
++++ b/src/kernels/expdec_bench.cpp
+@@ -68,6 +68,7 @@ struct Choice {
+     int d20 = 0;        // "d20" / "f16d20": + the GP100 IQ4_NL down on the 8-lane rows
+     bool f16 = false;
+     bool f16_gu = true;   // f16: the gate/up too (false for d16)
++    int f16_ver = 1;      // "f16v2": STRATA_GU_F16=2
+     bool d16 = false;   // "f16": the GP100 fp16 gate/up (not bitwise: compared by relative error)
+     K::NativeExpertExpdecParams p;   // every field set: the engine's startup values, then the choice's fields
+ };
+@@ -80,6 +81,7 @@ bool parse_choice(const std::string& s, Choice& c) {
+     c.p = g_engine_params;
+     if (s == "def") return true;
+     if (s == "f16") { c.f16 = true; return true; }
++    if (s == "f16v2") { c.f16 = true; c.f16_ver = 2; return true; }
+     if (s == "d20") { c.d20 = 1; return true; }
+     if (s == "f16d20") { c.f16 = true; c.d20 = 1; return true; }
+     if (s == "d16") { c.f16 = true; c.f16_gu = false; c.d16 = true; return true; }   // fp16 Q2_0 down only
+@@ -112,7 +114,7 @@ bool parse_choice(const std::string& s, Choice& c) {
+ 
+ void apply_choice(const Choice& c) {
+     K::native_expert_set_expdec(c.dec ? 1 : 0);
+-    K::native_expert_set_gu_f16(c.f16 && c.f16_gu ? 1 : 0);
++    K::native_expert_set_gu_f16(c.f16 && c.f16_gu ? c.f16_ver : 0);
+     K::native_expert_set_down_f16(c.d16 ? 1 : 0);
+     K::native_expert_set_sm60_d20(c.d20);
+     K::native_expert_set_expdec_params(c.p);
+-- 
+2.53.0
+

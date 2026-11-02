@@ -1,0 +1,126 @@
+From 8622cb0a464365e587bc650ff14efc33ce2b668c Mon Sep 17 00:00:00 2001
+From: qr0n <77075118+qr0n@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 20:10:49 +0000
+Subject: [PATCH 11/12] p100: STRATA_B6_F16=head - the verify head (Q5_K, 248k
+ vocab) on the GP100 fp16 multi-column GEMV
+
+The interleaved path was checked first, so STRATA_B6_F16=1 never reached the head at T=2-4.
+head scope + mode 2: only the head's GEMV takes gp100b6, every dense layer stays on the exact path.
+Profiled sc117: head 3.29 -> 1.70 ms/window, stage-1 total 25.87 -> 24.24. Gate vs GU2: answer
+region KL 0.00094, ppl ratio 1.0016 (prompt tokens 1.025 - low-prob tokens); tools 15/15.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/strata/kernels/native_mmvq.hpp |  3 +++
+ src/core/verify.cpp                    |  6 +++++-
+ src/kernels/cuda/b6_f16_gp100.cuh      | 21 +++++++++++++--------
+ src/kernels/cuda/native_mmvq.cu        | 14 ++++++++++++++
+ 4 files changed, 35 insertions(+), 9 deletions(-)
+
+diff --git a/include/strata/kernels/native_mmvq.hpp b/include/strata/kernels/native_mmvq.hpp
+index ce11095c..def2a0bd 100644
+--- a/include/strata/kernels/native_mmvq.hpp
++++ b/include/strata/kernels/native_mmvq.hpp
+@@ -157,6 +157,9 @@ void native_quantize_q8_1_il(const float* x, void* x_q8_1, void* x_il, int n_in,
+ void native_q8_1_interleave(const void* x_q8_1, void* x_il, int n_in, int ncols, void* stream);
+ // True when native_mmvq_il runs its own kernel for this call (IQ4_XS, Q4_K, Q5_K, Q6_K, 2-4 columns, the exact layout).
+ bool native_mmvq_il_supported(int ggml_type, int ncols, int n_out);
++// STRATA_B6_F16=head (sm_60): true when the verify head should run the fp16 GEMV (native_mmvq inside a head scope)
++bool native_b6_f16_head(int ggml_type, int ncols);
++void native_b6_f16_head_scope(bool on);
+ // native_mmvq for 2..4 columns whose copy native_q8_1_interleave wrote, bitwise native_mmvq's output: kernels in which a
+ // warp takes 1, 2 or 4 rows and reads the columns from the interleaved copy; native_mmvq (x_q8_1) when not supported.
+ void native_mmvq_il(int ggml_type, const void* weights, const void* x_q8_1, const void* x_il, float* y, int n_in,
+diff --git a/src/core/verify.cpp b/src/core/verify.cpp
+index c90768ae..87bf1855 100644
+--- a/src/core/verify.cpp
++++ b/src/core/verify.cpp
+@@ -2233,7 +2233,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+         if (head_ != nullptr && head_->loaded()) {
+             try {
+                 native_quantize_q8_1(head_mixed_, xq_, (int) N, T, cs);
+-                if (g_mmvq_il() && strata::kernels::native_mmvq_il_supported(head_->type(), (int) T, (int) n_vocab_)) {
++                if (strata::kernels::native_b6_f16_head(head_->type(), (int) T)) {   // STRATA_B6_F16=head
++                    strata::kernels::native_b6_f16_head_scope(true);
++                    native_mmvq(head_->type(), head_->weights(), xq_, head_logits_, (int) N, (int) n_vocab_, T, cs);
++                    strata::kernels::native_b6_f16_head_scope(false);
++                } else if (g_mmvq_il() && strata::kernels::native_mmvq_il_supported(head_->type(), (int) T, (int) n_vocab_)) {
+                     if (T >= 2) strata::kernels::native_q8_1_interleave(xq_, xil_, (int) N, (int) T, cs);
+                     strata::kernels::native_mmvq_il(head_->type(), head_->weights(), xq_, xil_, head_logits_, (int) N,
+                                                     (int) n_vocab_, (int) T, cs);
+diff --git a/src/kernels/cuda/b6_f16_gp100.cuh b/src/kernels/cuda/b6_f16_gp100.cuh
+index 5404633d..2c07d730 100644
+--- a/src/kernels/cuda/b6_f16_gp100.cuh
++++ b/src/kernels/cuda/b6_f16_gp100.cuh
+@@ -358,23 +358,28 @@ inline Scratch* scratch_for(cudaStream_t s) {
+     return &sc;
+ }
+ 
+-inline bool on() {
+-    static const bool v = [] {
++// STRATA_B6_F16=1: every 2..8-column dense GEMV of the four formats; STRATA_B6_F16=head: only the verify head's
++// (the caller opens head_scope around it).  0 = off, 1 = all, 2 = head only.
++inline int mode() {
++    static const int v = [] {
+         const char* e = std::getenv("STRATA_B6_F16");
+-        bool yes = e && e[0] == '1' && e[1] == '\0';
+-        if (yes) {
++        int m = !e ? 0 : std::strcmp(e, "1") == 0 ? 1 : std::strcmp(e, "head") == 0 ? 2 : 0;
++        if (m) {
+             int dev = 0, major = 0, minor = 0;
+             cudaGetDevice(&dev);
+             cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+             cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
+-            yes = major == 6 && minor == 0;
+-            std::fprintf(stderr, "strata b6 f16: %s\n", yes ? "GP100 fp16 dense GEMVs (Q4_K/Q5_K/Q6_K/IQ4_XS, 2..8 cols)"
+-                                                           : "STRATA_B6_F16=1 ignored (not compute capability 6.0)");
++            if (!(major == 6 && minor == 0)) m = 0;
++            std::fprintf(stderr, "strata b6 f16: %s\n", m == 1 ? "GP100 fp16 dense GEMVs (Q4_K/Q5_K/Q6_K/IQ4_XS, 2..8 cols)"
++                                                       : m == 2 ? "GP100 fp16 GEMV for the verify head only"
++                                                                : "STRATA_B6_F16 ignored (not compute capability 6.0)");
+         }
+-        return yes;
++        return m;
+     }();
+     return v;
+ }
++inline bool& head_scope() { static thread_local bool v = false; return v; }
++inline bool on() { const int m = mode(); return m == 1 || (m == 2 && head_scope()); }
+ inline bool check_on() {
+     static const bool v = [] { const char* e = std::getenv("STRATA_B6_F16_CHECK"); return e && e[0] == '1'; }();
+     return v;
+diff --git a/src/kernels/cuda/native_mmvq.cu b/src/kernels/cuda/native_mmvq.cu
+index cbe425db..54460c6e 100644
+--- a/src/kernels/cuda/native_mmvq.cu
++++ b/src/kernels/cuda/native_mmvq.cu
+@@ -3274,6 +3274,18 @@ bool il_arch_ok() {
+ }
+ }  // namespace
+ 
++// STRATA_B6_F16=head: the verify head takes the GP100 fp16 multi-column GEMV instead of the interleaved path
++#if !defined(__HIPCC__)
++bool native_b6_f16_head(int ggml_type, int ncols) {
++    return gp100b6::mode() == 2 && ncols >= 2 && ncols <= 8 &&
++           (ggml_type == 12 || ggml_type == 13 || ggml_type == 14 || ggml_type == 23);
++}
++void native_b6_f16_head_scope(bool on) { gp100b6::head_scope() = on; }
++#else
++bool native_b6_f16_head(int, int) { return false; }
++void native_b6_f16_head_scope(bool) {}
++#endif
++
+ bool native_mmvq_il_supported(int ggml_type, int ncols, int n_out) {
+     if (ncols < 1 || ncols > 8 || !g_multi_exact || !il_arch_ok()) return false;
+     return (g_tune_rows ? g_tune_rows : il_rows(ggml_type, ncols, n_out)) != 0 &&
+@@ -3313,6 +3325,8 @@ void native_q8_1_interleave(const void*, void*, int, int, void*) {
+     throw std::invalid_argument("native_q8_1_interleave is CUDA only");
+ }
+ bool native_mmvq_il_supported(int, int, int) { return false; }
++bool native_b6_f16_head(int, int) { return false; }
++void native_b6_f16_head_scope(bool) {}
+ int native_mmvq_il_rows_for(int, int, int, int) { return 0; }
+ void native_mmvq_il(int ggml_type, const void* weights, const void* x_q8_1, const void*, float* y, int n_in, int n_out,
+                     int ncols, void* stream) {
+-- 
+2.53.0
+
